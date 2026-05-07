@@ -475,7 +475,7 @@ actor MCPService: Service {
     private var currentProxy: StdioProxy?
 
     func run() async throws {
-        while true {
+        while !Task.isShuttingDownGracefully {
             do {
                 await log.info("Starting Bonjour service discovery...")
 
@@ -617,19 +617,22 @@ actor MCPService: Service {
             }
         }
     }
-
-    func shutdown() async throws {
-        browser?.cancel()
-        if let proxy = currentProxy {
-            await proxy.stop()
-        }
-    }
 }
 
-// Update the ServiceLifecycle initialization
+// `.gracefullyShutdownGroup` is load-bearing: `MCPService.run()` returns
+// when the Bonjour connection to the menubar app drops. With the library
+// default of `.cancelGroup`, that return raises `ServiceGroupError` at the
+// top level → Swift runtime fatal error. See ServiceGroupConfigurationTests.
 let lifecycle = ServiceGroup(
     configuration: .init(
-        services: [MCPService()],
+        services: [
+            .init(
+                service: MCPService(),
+                successTerminationBehavior: .gracefullyShutdownGroup,
+                failureTerminationBehavior: .gracefullyShutdownGroup
+            )
+        ],
+        gracefulShutdownSignals: [.sigint, .sigterm],
         logger: log
     )
 )
