@@ -33,3 +33,44 @@ playground.xcworkspace
 
 # Release artifacts
 dist/
+imcp-derived-release/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode build artifacts
+DerivedData/
+build/
+*.xcresult
+*.xcarchive
+
+# Xcode source control state (per-user)
+*.xccheckout
+*.xcscmblueprint
+*.xcuserstate
+
+# Local env files (secrets)
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# General temp / logs
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# IDEs
+.idea/
+*.iml
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+*.code-workspace
