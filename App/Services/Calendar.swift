@@ -94,6 +94,11 @@ final class CalendarService: Service {
                     ),
                     "hasAlarms": .boolean(),
                     "isRecurring": .boolean(),
+                    "organizer": .string(
+                        description:
+                            "Filter by who organized the event: 'me' for events you created or organize (including personal events with no other participants, birthdays, and subscribed holidays), 'others' for events someone else invited you to (e.g. a colleague's shared vacation/leave). Omit to include both.",
+                        enum: ["me", "others"]
+                    ),
                 ],
                 additionalProperties: false
             ),
@@ -216,7 +221,36 @@ final class CalendarService: Service {
                 events = events.filter { ($0.hasRecurrenceRules) == isRecurring }
             }
 
-            return events.map { Event($0) }
+            if case .string(let organizer) = arguments["organizer"] {
+                switch organizer {
+                case "me":
+                    events = events.filter { $0.isOrganizedByCurrentUser }
+                case "others":
+                    events = events.filter { !$0.isOrganizedByCurrentUser }
+                default:
+                    break
+                }
+            }
+
+            // Encode each event and annotate it with organizer information so callers
+            // can distinguish events the user owns from ones they were invited to.
+            let encoder = JSONEncoder()
+            encoder.userInfo[Ontology.DateTime.timeZoneOverrideKey] = TimeZone.current
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            let decoder = JSONDecoder()
+
+            return try events.map { ekEvent -> Value in
+                let data = try encoder.encode(Event(ekEvent))
+                var value = try decoder.decode(Value.self, from: data)
+                if case .object(var object) = value {
+                    object["organizedByMe"] = .bool(ekEvent.isOrganizedByCurrentUser)
+                    if let organizerName = ekEvent.organizerDisplayName {
+                        object["organizer"] = .string(organizerName)
+                    }
+                    value = .object(object)
+                }
+                return value
+            }
         }
         Tool(
             name: "events_create",

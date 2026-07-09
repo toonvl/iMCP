@@ -38,6 +38,30 @@ extension EKEventStatus {
     }
 }
 
+extension EKEvent {
+    /// Whether the current user organizes/owns this event, as opposed to having
+    /// been invited to it by someone else.
+    ///
+    /// An event with no organizer (e.g. a plain event you created, a birthday, or
+    /// a subscribed holiday) is treated as your own. An event that has an organizer
+    /// is yours only if that organizer is the current user; otherwise it was created
+    /// by someone else and shared/invited to you (e.g. a colleague's leave).
+    var isOrganizedByCurrentUser: Bool {
+        guard let organizer = organizer else { return true }
+        return organizer.isCurrentUser
+    }
+
+    /// Display name of the organizer, if the event was organized by someone else.
+    /// Returns `nil` for events you own or when no organizer information is available.
+    var organizerDisplayName: String? {
+        guard let organizer = organizer, !organizer.isCurrentUser else { return nil }
+        return organizer.name ?? organizer.url.absoluteString.replacingOccurrences(
+            of: "mailto:",
+            with: ""
+        )
+    }
+}
+
 extension EKRecurrenceFrequency {
     init(_ string: String) {
         switch string.lowercased() {
