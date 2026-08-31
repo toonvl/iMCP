@@ -68,6 +68,17 @@ final class CalendarService: Service {
                     object["organizer"] = .string(organizerName)
                 }
                 object["isRecurring"] = .bool(ekEvent.hasRecurrenceRules)
+                // A named place carries an EKStructuredLocation with real
+                // coordinates; `location` alone is just its display text.
+                if let structuredLocation = ekEvent.structuredLocation {
+                    if let geoLocation = structuredLocation.geoLocation {
+                        object["latitude"] = .double(geoLocation.coordinate.latitude)
+                        object["longitude"] = .double(geoLocation.coordinate.longitude)
+                    }
+                    if structuredLocation.radius > 0 {
+                        object["radius"] = .double(structuredLocation.radius)
+                    }
+                }
                 value = .object(object)
             }
             return value
@@ -440,6 +451,95 @@ final class CalendarService: Service {
         }
         return first
     }
+
+    /// Apply a `location` argument, which is either a display string or an
+    /// object carrying coordinates. Coordinates are kept in an
+    /// `EKStructuredLocation`, so the event gets a real map pin rather than
+    /// text a client would have to geocode again. An explicit null clears it.
+    private func applyLocation(_ value: Value, to event: EKEvent) throws {
+        if value.isNull {
+            event.structuredLocation = nil
+            event.location = nil
+            return
+        }
+
+        if case .string(let location) = value {
+            event.location = location
+            return
+        }
+
+        guard case .object(let object) = value else {
+            throw self.error(
+                10,
+                "\"location\" must be a string or an object with a \"name\" and coordinates"
+            )
+        }
+        guard let name = object["name"]?.stringValue, !name.isEmpty else {
+            throw self.error(10, "A \"location\" object requires a \"name\"")
+        }
+
+        let latitude = self.doubleArgument(object["latitude"])
+        let longitude = self.doubleArgument(object["longitude"])
+        guard (latitude == nil) == (longitude == nil) else {
+            throw self.error(
+                10,
+                "\"latitude\" and \"longitude\" must be provided together"
+            )
+        }
+
+        guard let latitude, let longitude else {
+            // Name only — no coordinates to preserve.
+            event.location = name
+            return
+        }
+        guard (-90 ... 90).contains(latitude), (-180 ... 180).contains(longitude) else {
+            throw self.error(
+                10,
+                "\"latitude\" must be between -90 and 90 and \"longitude\" between -180 and 180"
+            )
+        }
+
+        let structuredLocation = EKStructuredLocation(title: name)
+        structuredLocation.geoLocation = CLLocation(latitude: latitude, longitude: longitude)
+        if let radius = self.doubleArgument(object["radius"]), radius > 0 {
+            structuredLocation.radius = radius
+        }
+        event.structuredLocation = structuredLocation
+    }
+
+    /// Schema for the `location` argument, shared by events_create and
+    /// events_update.
+    private static let locationSchema: JSONSchema = .anyOf([
+        .string(
+            description:
+                "Location as display text, e.g. \"Sportcube\\nWaterleestvoetweg 12, 1980 Eppegem\""
+        ),
+        .object(
+            description:
+                "Location with coordinates, so the event carries a real map pin instead of text",
+            properties: [
+                "name": .string(
+                    description: "Display name or address shown on the event"
+                ),
+                "latitude": .number(
+                    description: "Latitude; must be given together with longitude",
+                    minimum: -90,
+                    maximum: 90
+                ),
+                "longitude": .number(
+                    description: "Longitude; must be given together with latitude",
+                    minimum: -180,
+                    maximum: 180
+                ),
+                "radius": .number(
+                    description: "Geofence radius in meters",
+                    minimum: 0
+                ),
+            ],
+            required: ["name"],
+            additionalProperties: false
+        ),
+    ])
 
     /// Schema for the `alarms` argument, shared by events_create and
     /// events_update.
@@ -828,7 +928,7 @@ final class CalendarService: Service {
                     "calendar": .string(
                         description: "Calendar to use (uses default if not specified)"
                     ),
-                    "location": .string(),
+                    "location": CalendarService.locationSchema,
                     "notes": .string(),
                     "url": .string(
                         format: .uri
@@ -945,8 +1045,8 @@ final class CalendarService: Service {
             event.calendar = targetCalendar
 
             // Set optional properties
-            if case .string(let location) = arguments["location"] {
-                event.location = location
+            if let location = arguments["location"] {
+                try self.applyLocation(location, to: event)
             }
 
             if case .string(let notes) = arguments["notes"] {
@@ -1027,7 +1127,7 @@ final class CalendarService: Service {
                     "calendar": .string(
                         description: "Move the event to this calendar"
                     ),
-                    "location": .string(),
+                    "location": CalendarService.locationSchema,
                     "notes": .string(),
                     "url": .string(
                         format: .uri
@@ -1155,8 +1255,8 @@ final class CalendarService: Service {
                 event.calendar = matchingCalendar
             }
 
-            if case .string(let location) = arguments["location"] {
-                event.location = location
+            if let location = arguments["location"] {
+                try self.applyLocation(location, to: event)
             }
 
             if case .string(let notes) = arguments["notes"] {
