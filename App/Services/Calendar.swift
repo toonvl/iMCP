@@ -452,94 +452,59 @@ final class CalendarService: Service {
         return first
     }
 
-    /// Apply a `location` argument, which is either a display string or an
-    /// object carrying coordinates. Coordinates are kept in an
-    /// `EKStructuredLocation`, so the event gets a real map pin rather than
-    /// text a client would have to geocode again. An explicit null clears it.
-    private func applyLocation(_ value: Value, to event: EKEvent) throws {
-        if value.isNull {
+    /// Apply the `location` arguments. Coordinates are kept in an
+    /// `EKStructuredLocation` so the event gets a real map pin rather than text
+    /// a client would have to geocode again.
+    ///
+    /// These are flat sibling arguments rather than one nested object because a
+    /// client that cannot express a composite schema will stringify an object
+    /// argument in transit, silently storing raw JSON as the location text.
+    private func applyLocation(from arguments: [String: Value], to event: EKEvent) throws {
+        let text = arguments["location"]?.stringValue
+        let latitude = self.doubleArgument(arguments["locationLatitude"])
+        let longitude = self.doubleArgument(arguments["locationLongitude"])
+
+        guard (latitude == nil) == (longitude == nil) else {
+            throw self.error(
+                10,
+                "\"locationLatitude\" and \"locationLongitude\" must be provided together"
+            )
+        }
+
+        // An explicit null or an empty string clears the location outright.
+        if arguments["location"]?.isNull == true || (text?.isEmpty == true && latitude == nil) {
             event.structuredLocation = nil
             event.location = nil
             return
         }
 
-        if case .string(let location) = value {
-            event.location = location
-            return
-        }
-
-        guard case .object(let object) = value else {
-            throw self.error(
-                10,
-                "\"location\" must be a string or an object with a \"name\" and coordinates"
-            )
-        }
-        guard let name = object["name"]?.stringValue, !name.isEmpty else {
-            throw self.error(10, "A \"location\" object requires a \"name\"")
-        }
-
-        let latitude = self.doubleArgument(object["latitude"])
-        let longitude = self.doubleArgument(object["longitude"])
-        guard (latitude == nil) == (longitude == nil) else {
-            throw self.error(
-                10,
-                "\"latitude\" and \"longitude\" must be provided together"
-            )
-        }
+        guard latitude != nil || text != nil else { return }
 
         guard let latitude, let longitude else {
-            // Name only — no coordinates to preserve.
-            event.location = name
+            event.location = text
             return
         }
         guard (-90 ... 90).contains(latitude), (-180 ... 180).contains(longitude) else {
             throw self.error(
                 10,
-                "\"latitude\" must be between -90 and 90 and \"longitude\" between -180 and 180"
+                "\"locationLatitude\" must be between -90 and 90 and \"locationLongitude\" between -180 and 180"
             )
         }
 
-        let structuredLocation = EKStructuredLocation(title: name)
+        // A structured location needs a title; fall back to what the event
+        // already shows when only coordinates are being changed.
+        let title = text ?? event.location ?? ""
+        guard !title.isEmpty else {
+            throw self.error(10, "Coordinates need a \"location\" naming the place")
+        }
+
+        let structuredLocation = EKStructuredLocation(title: title)
         structuredLocation.geoLocation = CLLocation(latitude: latitude, longitude: longitude)
-        if let radius = self.doubleArgument(object["radius"]), radius > 0 {
+        if let radius = self.doubleArgument(arguments["locationRadius"]), radius > 0 {
             structuredLocation.radius = radius
         }
         event.structuredLocation = structuredLocation
     }
-
-    /// Schema for the `location` argument, shared by events_create and
-    /// events_update.
-    private static let locationSchema: JSONSchema = .anyOf([
-        .string(
-            description:
-                "Location as display text, e.g. \"Sportcube\\nWaterleestvoetweg 12, 1980 Eppegem\""
-        ),
-        .object(
-            description:
-                "Location with coordinates, so the event carries a real map pin instead of text",
-            properties: [
-                "name": .string(
-                    description: "Display name or address shown on the event"
-                ),
-                "latitude": .number(
-                    description: "Latitude; must be given together with longitude",
-                    minimum: -90,
-                    maximum: 90
-                ),
-                "longitude": .number(
-                    description: "Longitude; must be given together with latitude",
-                    minimum: -180,
-                    maximum: 180
-                ),
-                "radius": .number(
-                    description: "Geofence radius in meters",
-                    minimum: 0
-                ),
-            ],
-            required: ["name"],
-            additionalProperties: false
-        ),
-    ])
 
     /// Schema for the `alarms` argument, shared by events_create and
     /// events_update.
@@ -928,7 +893,26 @@ final class CalendarService: Service {
                     "calendar": .string(
                         description: "Calendar to use (uses default if not specified)"
                     ),
-                    "location": CalendarService.locationSchema,
+                    "location": .string(
+                        description:
+                            "Display text for the place, e.g. \"Sportcube\\nWaterleestvoetweg 12, 1980 Eppegem\". Pass an empty string to clear the location."
+                    ),
+                    "locationLatitude": .number(
+                        description:
+                            "Latitude of the location; give together with locationLongitude to store a real map pin instead of plain text",
+                        minimum: -90,
+                        maximum: 90
+                    ),
+                    "locationLongitude": .number(
+                        description:
+                            "Longitude of the location; give together with locationLatitude",
+                        minimum: -180,
+                        maximum: 180
+                    ),
+                    "locationRadius": .number(
+                        description: "Geofence radius in meters for the location",
+                        minimum: 0
+                    ),
                     "notes": .string(),
                     "url": .string(
                         format: .uri
@@ -1045,9 +1029,7 @@ final class CalendarService: Service {
             event.calendar = targetCalendar
 
             // Set optional properties
-            if let location = arguments["location"] {
-                try self.applyLocation(location, to: event)
-            }
+            try self.applyLocation(from: arguments, to: event)
 
             if case .string(let notes) = arguments["notes"] {
                 event.notes = notes
@@ -1085,7 +1067,7 @@ final class CalendarService: Service {
         Tool(
             name: "events_update",
             description:
-                "Update an existing calendar event. Locate it by \"identifier\" (from events_fetch, recommended) or by \"title\". Only provide the properties you want to change; omitted properties are left unchanged. When locating by identifier, passing \"title\" renames the event. Pass \"recurrence\": null to turn a repeating event into a one-off.",
+                "Update an existing calendar event. Locate it by \"identifier\" (from events_fetch, recommended) or by \"title\". Only provide the properties you want to change; omitted properties are left unchanged. When locating by identifier, passing \"title\" renames the event. Set \"clearRecurrence\" to true to turn a repeating event into a one-off.",
             inputSchema: .object(
                 properties: [
                     "identifier": .string(
@@ -1127,7 +1109,26 @@ final class CalendarService: Service {
                     "calendar": .string(
                         description: "Move the event to this calendar"
                     ),
-                    "location": CalendarService.locationSchema,
+                    "location": .string(
+                        description:
+                            "Display text for the place, e.g. \"Sportcube\\nWaterleestvoetweg 12, 1980 Eppegem\". Pass an empty string to clear the location."
+                    ),
+                    "locationLatitude": .number(
+                        description:
+                            "Latitude of the location; give together with locationLongitude to store a real map pin instead of plain text",
+                        minimum: -90,
+                        maximum: 90
+                    ),
+                    "locationLongitude": .number(
+                        description:
+                            "Longitude of the location; give together with locationLatitude",
+                        minimum: -180,
+                        maximum: 180
+                    ),
+                    "locationRadius": .number(
+                        description: "Geofence radius in meters for the location",
+                        minimum: 0
+                    ),
                     "notes": .string(),
                     "url": .string(
                         format: .uri
@@ -1141,7 +1142,11 @@ final class CalendarService: Service {
                         description:
                             "Replace the event's alarms with these. Pass an empty array to remove all alarms."
                     ),
-                    "recurrence": .anyOf([CalendarService.recurrenceSchema, .null]),
+                    "recurrence": CalendarService.recurrenceSchema,
+                    "clearRecurrence": .boolean(
+                        description:
+                            "Remove the recurrence rule, turning a repeating event into a one-off"
+                    ),
                     "span": .string(
                         description:
                             "For a repeating event, whether the change applies only to the located occurrence or to it and all later ones. Ignored for one-off events.",
@@ -1255,9 +1260,7 @@ final class CalendarService: Service {
                 event.calendar = matchingCalendar
             }
 
-            if let location = arguments["location"] {
-                try self.applyLocation(location, to: event)
-            }
+            try self.applyLocation(from: arguments, to: event)
 
             if case .string(let notes) = arguments["notes"] {
                 event.notes = notes
@@ -1279,7 +1282,9 @@ final class CalendarService: Service {
             // one-off event.
             if case .object(let recurrence) = arguments["recurrence"] {
                 event.recurrenceRules = [try self.makeRecurrenceRule(from: recurrence)]
-            } else if arguments["recurrence"]?.isNull == true {
+            } else if arguments["clearRecurrence"]?.boolValue == true
+                || arguments["recurrence"]?.isNull == true
+            {
                 event.recurrenceRules = nil
             }
 
