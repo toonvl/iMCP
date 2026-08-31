@@ -37,8 +37,12 @@ extension ISO8601DateFormatter {
         }
 
         // If the string already includes a timezone, don't guess with local-time parsing.
+        // A date-only string is exempt: the `-dd` ending of e.g. `2026-09-07` matches
+        // the `-hh` offset pattern below, which would otherwise reject every bare date
+        // before the `yyyy-MM-dd` fallback below could parse it as local midnight.
         let hasTimeZoneInfo =
-            dateString.range(
+            !isDateOnlyISO8601String(dateString)
+            && dateString.range(
                 of: #"([Zz]|[+-]\d{2}(:?\d{2})?)$"#,
                 options: .regularExpression
             ) != nil
