@@ -1,0 +1,20 @@
+// Copy to Local.xcconfig (untracked) and fill in your own values.
+//
+// Local.xcconfig is included last by both Debug.xcconfig and Release.xcconfig,
+// so every setting here overrides the tracked defaults. Nothing in it is ever
+// committed, which is the point: signing identity is per-machine.
+
+// Your Apple Developer Team ID (Xcode > Settings > Accounts).
+DEVELOPMENT_TEAM = XXXXXXXXXX
+
+// A bundle id you can actually sign. The app's mach-lookup entitlements are
+// derived from this, so the CLI keeps finding the app whatever you choose.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.imcp
+
+CODE_SIGN_STYLE = Automatic
+CODE_SIGN_IDENTITY = Apple Development
+
+// Debug sets CODE_SIGNING_ALLOWED = NO, so ad-hoc signing is enough there and
+// avoids needing a provisioning profile for a local run.
+CODE_SIGN_IDENTITY[sdk=macosx*][config=Debug] = -
+CODE_SIGN_IDENTITY[sdk=macosx*][config=Release] = Apple Development

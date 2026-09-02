@@ -1,0 +1,11 @@
+// Base configuration for the iMCP app target, Release.
+// See Debug.xcconfig for the rationale; Local.xcconfig (untracked) wins.
+
+CODE_SIGN_IDENTITY = Apple Development
+CODE_SIGN_STYLE = Automatic
+DEVELOPMENT_TEAM = TTY35UM57S
+PRODUCT_BUNDLE_IDENTIFIER = co.dododo.iMCP
+
+ENABLE_RESOURCE_ACCESS_LOCATION = YES
+
+#include? "Local.xcconfig"

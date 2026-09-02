@@ -74,3 +74,6 @@ build/
 !.vscode/tasks.json
 !.vscode/extensions.json
 *.code-workspace
+
+# Machine-local build settings (signing identity, team, bundle id)
+Config/Local.xcconfig

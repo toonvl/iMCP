@@ -1,0 +1,19 @@
+// Base configuration for the iMCP app target, Debug.
+//
+// These are the upstream (mattt/iMCP) defaults, kept here rather than inline in
+// project.pbxproj so that a developer's own signing identity never has to be
+// edited into — and accidentally committed from — the tracked project file.
+//
+// To build with your own Apple ID, copy Local.xcconfig.example to
+// Local.xcconfig and fill it in. That file is untracked and is included last,
+// so anything it sets wins over the defaults below.
+
+CODE_SIGN_IDENTITY = -
+CODE_SIGN_IDENTITY[sdk=macosx*] = Apple Development
+CODE_SIGN_STYLE = Manual
+DEVELOPMENT_TEAM =
+PRODUCT_BUNDLE_IDENTIFIER = co.dododo.iMCP
+
+ENABLE_RESOURCE_ACCESS_LOCATION = YES
+
+#include? "Local.xcconfig"
