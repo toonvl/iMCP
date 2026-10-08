@@ -1,7 +1,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="Assets/hero-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="Assets/hero-light.svg">
-  <img alt="iMCP">
+  <img src="Assets/hero-light.svg" alt="iMCP">
 </picture>
 
 iMCP is a macOS app for connecting your digital life with AI.
@@ -49,10 +49,24 @@ and a [growing list of clients][mcp-clients] that support the
   </tr>
   <tr>
     <th>
+      <img src="Assets/phone.svg" width="48" height="48" alt="" role="presentation"/>
+    </th>
+    <td><strong>Phone</strong></td>
+    <td>View call history synced from your iPhone, filter calls by participant, date, or call type, and start calls with system confirmation.</td>
+  </tr>
+  <tr>
+    <th>
       <img src="Assets/reminders.svg" width="48" height="48" alt="" role="presentation"/>
     </th>
     <td><strong>Reminders</strong></td>
     <td>View and create reminders with customizable due dates, priorities, and alerts across different reminder lists.</td>
+  </tr>
+  <tr>
+    <th>
+      <img src="Assets/shortcuts.svg" width="48" height="48" alt="" role="presentation"/>
+    </th>
+    <td><strong>Shortcuts</strong></td>
+    <td>List and run shortcuts on your Mac, with optional text input.</td>
   </tr>
   <tr>
     <th>
@@ -277,9 +291,17 @@ However, the Messages app on macOS stores data in a SQLite database located at
 iMCP runs in [App Sandbox][app-sandbox],
 which limits its access to user data and system resources.
 When you go to enable the Messages service,
-you'll be prompted to open the `chat.db` file through the standard file picker.
-When you do, macOS adds that file to the app's sandbox.
+you'll be prompted to select your `~/Library/Messages` folder through the standard file picker.
+When you do, macOS adds that folder to the app's sandbox.
 [`NSOpenPanel`][nsopenpanel] is magic like that.
+The folder matters: `chat.db` is a WAL-mode database,
+and Messages writes every new message to `chat.db-wal` next to it first,
+only folding the log into `chat.db` at a checkpoint every few MB —
+often hours later.
+A grant on `chat.db` alone (what earlier versions asked for)
+leaves that log unreadable, so the newest messages were missing until then.
+If you granted `chat.db` with an earlier version, Messages keeps working from the last checkpoint;
+switch Messages off and on in the iMCP menu to grant the folder instead.
 
 But opening the iMessage database is just half the battle.
 Over the past few years,
@@ -291,6 +313,14 @@ a Swift package for reading your iMessage database.
 It includes a Swift implementation for decoding Apple's `typedstream` format,
 adapted from Christopher Sardegna's [imessage-exporter] project
 and [blog post about reverse-engineering `typedstream`][typedstream-blog-post].
+
+### Call History Database Access
+
+Call history synced from your iPhone lives in a SQLite database at
+`~/Library/Application Support/CallHistoryDB/CallHistory.storedata`.
+Recent calls sit in its write-ahead log next to the store file,
+so the Phone service asks you to open the `CallHistoryDB` folder
+rather than the file alone.
 
 ### JSON-LD for Tool Results
 
@@ -321,6 +351,17 @@ It includes convenience initializers for types from Apple frameworks,
 such as those returned by iMCP tools.
 
 ## Debugging
+
+### Allowing local network access
+
+`imcp-server` finds the iMCP app with Bonjour,
+so it needs permission to access the local network.
+`imcp-server` has its own entry in
+System Settings > Privacy & Security > Local Network,
+separate from iMCP and from the app that runs it, such as your terminal.
+If that entry is turned off,
+`imcp-server` can't find the app
+and reports that Bonjour service discovery timed out.
 
 ### Using the MCP Inspector
 

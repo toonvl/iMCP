@@ -672,7 +672,7 @@ final class CalendarService: Service {
                 openWorldHint: false
             )
         ) { arguments in
-            guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+            guard try await self.eventStore.requestFullAccessToEvents() else {
                 log.error("Calendar access not authorized")
                 throw NSError(
                     domain: "CalendarError",
@@ -706,7 +706,7 @@ final class CalendarService: Service {
                     ),
                     "end": .string(
                         description:
-                            "End date/time (defaults to one week from start; one day if start is date-only). If timezone is omitted, local time is assumed.",
+                            "End date/time (defaults to one week from start; one day if start is date-only). If timezone is omitted, local time is assumed. A date-only value includes that whole day.",
                         format: .dateTime
                     ),
                     "calendars": .array(
@@ -744,7 +744,7 @@ final class CalendarService: Service {
                 openWorldHint: false
             )
         ) { arguments in
-            guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+            guard try await self.eventStore.requestFullAccessToEvents() else {
                 log.error("Calendar access not authorized")
                 throw NSError(
                     domain: "CalendarError",
@@ -772,11 +772,21 @@ final class CalendarService: Service {
             var startIsDateOnly = false
             var endIsDateOnly = false
 
-            if case .string(let start) = arguments["start"],
-                let parsedStart = ISO8601DateFormatter.parsedLenientISO8601Date(
-                    fromISO8601String: start
-                )
-            {
+            if case .string(let start) = arguments["start"] {
+                guard
+                    let parsedStart = ISO8601DateFormatter.parsedLenientISO8601Date(
+                        fromISO8601String: start
+                    )
+                else {
+                    throw NSError(
+                        domain: "CalendarError",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Invalid start date format. Expected ISO 8601 format."
+                        ]
+                    )
+                }
                 hasStart = true
                 startDate = parsedStart.date
                 startIsDateOnly = parsedStart.isDateOnly
@@ -940,9 +950,7 @@ final class CalendarService: Service {
                 openWorldHint: false
             )
         ) { arguments in
-            try await self.activate()
-
-            guard EKEventStore.authorizationStatus(for: .event) == .fullAccess else {
+            guard try await self.eventStore.requestFullAccessToEvents() else {
                 log.error("Calendar access not authorized")
                 throw NSError(
                     domain: "CalendarError",
@@ -1375,6 +1383,146 @@ final class CalendarService: Service {
                 "start": .string(deletedStart),
                 "wasRecurring": .bool(wasRecurring),
                 "span": .string(span.stringValue),
+            ])
+        }
+
+        Tool(
+            name: "events_delete",
+            description:
+                "Delete a calendar event by identifier. For a recurring event, pass the start date of the occurrence to delete.",
+            inputSchema: .object(
+                properties: [
+                    "identifier": .string(description: "The event identifier"),
+                    "start": .string(
+                        description:
+                            "Start date of the occurrence to delete (ISO 8601). Required for recurring events, since every occurrence shares the same identifier."
+                    ),
+                    "span": .string(
+                        description:
+                            "For recurring events: delete only this occurrence, or this and all future events",
+                        default: .string("thisEvent"),
+                        enum: ["thisEvent", "futureEvents"]
+                    ),
+                ],
+                required: ["identifier"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Delete Event",
+                readOnlyHint: false,
+                destructiveHint: true,
+                idempotentHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            guard try await self.eventStore.requestFullAccessToEvents() else {
+                log.error("Calendar access not authorized")
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Calendar access not authorized"]
+                )
+            }
+
+            guard case .string(let identifier) = arguments["identifier"] else {
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Event identifier is required"]
+                )
+            }
+
+            let span: EKSpan
+            switch arguments["span"]?.stringValue {
+            case nil, "thisEvent":
+                span = .thisEvent
+            case "futureEvents":
+                span = .futureEvents
+            case let other?:
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Invalid span \"\(other)\". Expected \"thisEvent\" or \"futureEvents\"."
+                    ]
+                )
+            }
+
+            // Every occurrence of a recurring event shares one identifier,
+            // and `event(withIdentifier:)` always resolves it to the first occurrence.
+            // When a start date is given,
+            // refetch that exact occurrence so `thisEvent` removes the right one
+            // and `futureEvents` starts from it rather than from the whole series.
+            guard let anyOccurrence = self.eventStore.event(withIdentifier: identifier) else {
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "No event found with identifier \(identifier)"
+                    ]
+                )
+            }
+
+            let event: EKEvent
+            if case .string(let startString) = arguments["start"] {
+                guard
+                    let parsedStart = ISO8601DateFormatter.parsedLenientISO8601Date(
+                        fromISO8601String: startString
+                    )
+                else {
+                    throw NSError(
+                        domain: "CalendarError",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Invalid start date format. Expected ISO 8601 format."
+                        ]
+                    )
+                }
+                let startDate = Calendar.current.normalizedStartDate(
+                    from: parsedStart.date,
+                    isDateOnly: parsedStart.isDateOnly
+                )
+                let predicate = self.eventStore.predicateForEvents(
+                    withStart: startDate,
+                    end: startDate.addingTimeInterval(1),
+                    calendars: nil
+                )
+                guard
+                    let occurrence = self.eventStore.events(matching: predicate).first(where: {
+                        $0.eventIdentifier == identifier
+                            && abs($0.startDate.timeIntervalSince(startDate)) < 1
+                    })
+                else {
+                    throw NSError(
+                        domain: "CalendarError",
+                        code: 3,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No occurrence of event \(identifier) starts at \(startString)"
+                        ]
+                    )
+                }
+                event = occurrence
+            } else if anyOccurrence.hasRecurrenceRules {
+                throw NSError(
+                    domain: "CalendarError",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Event \(identifier) is recurring. Pass the start date of the occurrence to delete."
+                    ]
+                )
+            } else {
+                event = anyOccurrence
+            }
+
+            try self.eventStore.remove(event, span: span, commit: true)
+
+            return Value.object([
+                "deleted": .bool(true),
+                "identifier": .string(identifier),
             ])
         }
     }
