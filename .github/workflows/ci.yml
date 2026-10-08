@@ -27,18 +27,34 @@ jobs:
             - name: Checkout code
               uses: actions/checkout@v6
 
+            # Key the cache on the exact Xcode build,
+            # so a runner image update can't restore module files
+            # compiled against an older toolchain.
+            - name: Read Xcode build number
+              id: xcode
+              run: echo "build=$(xcodebuild -version | awk '/Build version/ {print $3}')" >> "${GITHUB_OUTPUT}"
+
             - name: Cache Xcode build artifacts
               uses: actions/cache@v5
               with:
                   path: |
                       ~/Library/Developer/Xcode/DerivedData
+                      !~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex
                       ~/Library/Caches/org.swift.swiftpm
-                  key: ${{ runner.os }}-xcode-${{ matrix.xcode }}-derived-${{ hashFiles('**/Package.resolved') }}
+                  key: ${{ runner.os }}-xcode-${{ steps.xcode.outputs.build }}-derived-${{ hashFiles('**/Package.resolved') }}
                   restore-keys: |
-                      ${{ runner.os }}-xcode-${{ matrix.xcode }}-derived-
+                      ${{ runner.os }}-xcode-${{ steps.xcode.outputs.build }}-derived-
 
             - name: Lint
               run: swift format lint --strict --recursive .
 
             - name: Build
               run: xcodebuild -quiet -scheme iMCP -configuration Debug -destination "platform=macOS" build
+
+            # The cache action's exclude pattern has not kept the module cache out of
+            # the archive, and runner images with the same Xcode build can differ in
+            # toolchain file timestamps, which makes a restored module cache fatal.
+            # Remove it before the cache is saved at the end of the job.
+            - name: Drop the module cache before saving
+              if: always()
+              run: rm -rf ~/Library/Developer/Xcode/DerivedData/ModuleCache.noindex

@@ -1,14 +1,15 @@
 import AppKit
-import MenuBarExtraAccess
+import Sparkle
 import SwiftUI
 
 struct ContentView: View {
     @ObservedObject var serverController: ServerController
     @Binding var isEnabled: Bool
-    @Binding var isMenuPresented: Bool
     @Environment(\.openSettings) private var openSettings
 
     private let aboutWindowController: AboutWindowController
+    private let updater: SPUUpdater
+    @State private var menuPanel = MenuPanelController()
 
     private var serviceConfigs: [ServiceConfig] {
         serverController.computedServiceConfigs
@@ -25,12 +26,12 @@ struct ContentView: View {
     init(
         serverManager: ServerController,
         isEnabled: Binding<Bool>,
-        isMenuPresented: Binding<Bool>
+        updater: SPUUpdater
     ) {
         self.serverController = serverManager
         self._isEnabled = isEnabled
-        self._isMenuPresented = isMenuPresented
         self.aboutWindowController = AboutWindowController()
+        self.updater = updater
     }
 
     var body: some View {
@@ -72,18 +73,17 @@ struct ContentView: View {
                         await serverController.updateServiceBindings(serviceBindings)
                     }
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
-                .animation(.easeInOut(duration: 0.3), value: isEnabled)
             }
+            // No animation: it desyncs this auto-sizing panel's frame from its content.
 
             VStack(alignment: .leading, spacing: 2) {
                 Divider()
 
-                MenuButton("Configure Claude Desktop", isMenuPresented: $isMenuPresented) {
+                MenuButton("Configure Claude Desktop") {
                     ClaudeDesktop.showConfigurationPanel()
                 }
 
-                MenuButton("Copy server command to clipboard", isMenuPresented: $isMenuPresented) {
+                MenuButton("Copy server command to clipboard") {
                     let command = Bundle.main.bundleURL
                         .appendingPathComponent("Contents/MacOS/imcp-server")
                         .path
@@ -91,6 +91,8 @@ struct ContentView: View {
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
                     pasteboard.setString(command, forType: .string)
+
+                    _ = NSSound.play(.pop)
                 }
             }
             .padding(.top, 8)
@@ -100,16 +102,23 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Divider()
 
-                MenuButton("Settings...", isMenuPresented: $isMenuPresented) {
+                MenuButton("Settings...") {
+                    // openSettings() alone is unreliable for this accessory (LSUIElement) app.
+                    NSApp.activate(ignoringOtherApps: true)
                     openSettings()
                 }
 
-                MenuButton("About iMCP", isMenuPresented: $isMenuPresented) {
+                MenuButton("Check for Updates...") {
+                    updater.checkForUpdates()
+                }
+                .disabled(!updater.canCheckForUpdates)
+
+                MenuButton("About iMCP") {
                     aboutWindowController.showWindow(nil)
                     NSApp.activate(ignoringOtherApps: true)
                 }
 
-                MenuButton("Quit", isMenuPresented: $isMenuPresented) {
+                MenuButton("Quit") {
                     NSApplication.shared.terminate(nil)
                 }
             }
@@ -117,7 +126,96 @@ struct ContentView: View {
             .padding(.horizontal, 2)
         }
         .padding(.vertical, 6)
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            proxy.size.height
+        } action: { height in
+            menuPanel.contentHeight = height
+            menuPanel.resizeToFitContent()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Material.thick)
+        .background(MenuPanelWindowReader(controller: menuPanel))
+    }
+}
+
+/// Resizes the `MenuBarExtra` panel that shows ``ContentView`` to fit its content.
+@MainActor
+final class MenuPanelController {
+    var contentHeight: CGFloat = 0
+
+    private weak var window: NSWindow?
+    private var windowObserver: NSObjectProtocol?
+
+    func attach(to newWindow: NSWindow?) {
+        guard newWindow !== window else { return }
+
+        if let windowObserver {
+            NotificationCenter.default.removeObserver(windowObserver)
+            self.windowObserver = nil
+        }
+
+        window = newWindow
+        guard let newWindow else { return }
+
+        windowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: newWindow,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.resizeToFitContent()
+            }
+        }
+        resizeToFitContent()
+    }
+
+    // MenuBarExtra's window keeps a stale taller frame when its content shrinks,
+    // leaving the content vertically centered in an oversized panel. Resize it to fit.
+    func resizeToFitContent() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let window = self.window, self.contentHeight > 0 else { return }
+            let frame = window.frame
+            guard abs(frame.height - self.contentHeight) > 0.5 else { return }
+            window.setFrame(
+                NSRect(
+                    x: frame.minX,
+                    y: frame.maxY - self.contentHeight,
+                    width: frame.width,
+                    height: self.contentHeight
+                ),
+                display: true
+            )
+        }
+    }
+}
+
+/// Gives ``MenuPanelController`` the window that contains this view.
+private struct MenuPanelWindowReader: NSViewRepresentable {
+    let controller: MenuPanelController
+
+    func makeNSView(context: Context) -> WindowReaderView {
+        WindowReaderView(controller: controller)
+    }
+
+    func updateNSView(_ nsView: WindowReaderView, context: Context) {}
+
+    final class WindowReaderView: NSView {
+        private let controller: MenuPanelController
+
+        init(controller: MenuPanelController) {
+            self.controller = controller
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            controller.attach(to: window)
+        }
     }
 }
 
@@ -126,17 +224,15 @@ private struct MenuButton: View {
 
     private let title: String
     private let action: () -> Void
-    @Binding private var isMenuPresented: Bool
+    @Environment(\.dismiss) private var dismiss
     @State private var isHighlighted: Bool = false
     @State private var isPressed: Bool = false
 
     init<S>(
         _ title: S,
-        isMenuPresented: Binding<Bool>,
         action: @escaping () -> Void
     ) where S: StringProtocol {
         self.title = String(title)
-        self._isMenuPresented = isMenuPresented
         self.action = action
     }
 
@@ -167,7 +263,10 @@ private struct MenuButton: View {
                 }
 
                 action()
-                isMenuPresented = false
+
+                // Hiding the panel window directly leaves the status item presented,
+                // so the next click on it does nothing.
+                dismiss()
             }
         }
         .frame(height: 18)

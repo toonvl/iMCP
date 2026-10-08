@@ -189,7 +189,7 @@ final class RemindersService: Service {
                 openWorldHint: false
             )
         ) { arguments in
-            guard EKEventStore.authorizationStatus(for: .reminder) == .fullAccess else {
+            guard try await self.eventStore.requestFullAccessToReminders() else {
                 log.error("Reminders access not authorized")
                 throw NSError(
                     domain: "RemindersError",
@@ -227,7 +227,7 @@ final class RemindersService: Service {
                     ),
                     "end": .string(
                         description:
-                            "End date/time range for fetching reminders. If timezone is omitted, local time is assumed. Date-only uses local midnight.",
+                            "End date/time range for fetching reminders. If timezone is omitted, local time is assumed. A date-only value includes that whole day.",
                         format: .dateTime
                     ),
                     "lists": .array(
@@ -247,9 +247,7 @@ final class RemindersService: Service {
                 openWorldHint: false
             )
         ) { arguments in
-            try await self.activate()
-
-            guard EKEventStore.authorizationStatus(for: .reminder) == .fullAccess else {
+            guard try await self.eventStore.requestFullAccessToReminders() else {
                 log.error("Reminders access not authorized")
                 throw NSError(
                     domain: "RemindersError",
@@ -305,31 +303,35 @@ final class RemindersService: Service {
                 endDate = calendar.normalizedEndDate(from: endDateValue, isDateOnly: endIsDateOnly)
             }
 
-            // Create predicate based on completion status
-            let predicate: NSPredicate
+            // Choose predicates based on completion status: completed reminders match by
+            // completion date and incomplete ones by due date.
+            let completedPredicate = self.eventStore.predicateForCompletedReminders(
+                withCompletionDateStarting: startDate,
+                ending: endDate,
+                calendars: reminderLists
+            )
+            let incompletePredicate = self.eventStore.predicateForIncompleteReminders(
+                withDueDateStarting: startDate,
+                ending: endDate,
+                calendars: reminderLists
+            )
+            let predicates: [NSPredicate]
             if case .bool(let completed) = arguments["completed"] {
-                if completed {
-                    predicate = self.eventStore.predicateForCompletedReminders(
-                        withCompletionDateStarting: startDate,
-                        ending: endDate,
-                        calendars: reminderLists
-                    )
-                } else {
-                    predicate = self.eventStore.predicateForIncompleteReminders(
-                        withDueDateStarting: startDate,
-                        ending: endDate,
-                        calendars: reminderLists
-                    )
-                }
+                predicates = [completed ? completedPredicate : incompletePredicate]
+            } else if startDate != nil || endDate != nil {
+                // Without a completion status, a date range applies to both kinds.
+                predicates = [incompletePredicate, completedPredicate]
             } else {
-                // If completion status not specified, use incomplete predicate as default
-                predicate = self.eventStore.predicateForReminders(in: reminderLists)
+                predicates = [self.eventStore.predicateForReminders(in: reminderLists)]
             }
 
             // Fetch reminders
-            let reminders = try await withCheckedThrowingContinuation { continuation in
-                self.eventStore.fetchReminders(matching: predicate) { fetchedReminders in
-                    continuation.resume(returning: fetchedReminders ?? [])
+            var reminders: [EKReminder] = []
+            for predicate in predicates {
+                reminders += try await withCheckedThrowingContinuation { continuation in
+                    self.eventStore.fetchReminders(matching: predicate) { fetchedReminders in
+                        continuation.resume(returning: fetchedReminders ?? [])
+                    }
                 }
             }
 
@@ -416,9 +418,7 @@ final class RemindersService: Service {
                 openWorldHint: false
             )
         ) { arguments in
-            try await self.activate()
-
-            guard EKEventStore.authorizationStatus(for: .reminder) == .fullAccess else {
+            guard try await self.eventStore.requestFullAccessToReminders() else {
                 log.error("Reminders access not authorized")
                 throw NSError(
                     domain: "RemindersError",

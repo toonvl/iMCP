@@ -56,6 +56,7 @@ enum ServiceRegistry {
             LocationService.shared,
             MapsService.shared,
             MessageService.shared,
+            PhoneService.shared,
             RemindersService.shared,
             ShortcutsService.shared,
             UtilitiesService.shared,
@@ -73,6 +74,7 @@ enum ServiceRegistry {
         locationEnabled: Binding<Bool>,
         mapsEnabled: Binding<Bool>,
         messagesEnabled: Binding<Bool>,
+        phoneEnabled: Binding<Bool>,
         remindersEnabled: Binding<Bool>,
         shortcutsEnabled: Binding<Bool>,
         utilitiesEnabled: Binding<Bool>,
@@ -122,6 +124,13 @@ enum ServiceRegistry {
                 binding: messagesEnabled
             ),
             ServiceConfig(
+                name: "Phone",
+                iconName: "phone.fill",
+                color: .green,
+                service: PhoneService.shared,
+                binding: phoneEnabled
+            ),
+            ServiceConfig(
                 name: "Reminders",
                 iconName: "list.bullet",
                 color: .orange,
@@ -154,12 +163,12 @@ enum ServiceRegistry {
 @MainActor
 final class ServerController: ObservableObject {
     @Published var serverStatus: String = "Starting..."
-    @Published var pendingConnectionID: String?
-    @Published var pendingClientName: String = ""
 
+    /// Clients with an approval window on screen.
+    /// Keyed by client name so that concurrent requests
+    /// from different clients each keep their own state.
     private var activeApprovalDialogs: Set<String> = []
     private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
-    private var currentApprovalHandlers: (approve: () -> Void, deny: () -> Void)?
     private let approvalWindowController = ConnectionApprovalWindowController()
 
     private let networkManager = ServerNetworkManager()
@@ -171,6 +180,7 @@ final class ServerController: ObservableObject {
     @AppStorage("locationEnabled") private var locationEnabled = false
     @AppStorage("mapsEnabled") private var mapsEnabled = true  // Default enabled
     @AppStorage("messagesEnabled") private var messagesEnabled = false
+    @AppStorage("phoneEnabled") private var phoneEnabled = false
     @AppStorage("remindersEnabled") private var remindersEnabled = false
     @AppStorage("shortcutsEnabled") private var shortcutsEnabled = false
     @AppStorage("utilitiesEnabled") private var utilitiesEnabled = true  // Default enabled
@@ -178,6 +188,10 @@ final class ServerController: ObservableObject {
 
     // MARK: - AppStorage for Trusted Clients
     @AppStorage("trustedClients") private var trustedClientsData = Data()
+
+    // MARK: - AppStorage for Disabled Tools
+    @AppStorage("disabledTools") private var disabledToolsData = Data()
+    private var disabledToolsGeneration = 0
 
     // MARK: - Computed Properties for Service Configurations and Bindings
     var computedServiceConfigs: [ServiceConfig] {
@@ -188,6 +202,7 @@ final class ServerController: ObservableObject {
             locationEnabled: $locationEnabled,
             mapsEnabled: $mapsEnabled,
             messagesEnabled: $messagesEnabled,
+            phoneEnabled: $phoneEnabled,
             remindersEnabled: $remindersEnabled,
             shortcutsEnabled: $shortcutsEnabled,
             utilitiesEnabled: $utilitiesEnabled,
@@ -237,15 +252,54 @@ final class ServerController: ObservableObject {
         trustedClients = Set<String>()
     }
 
-    // MARK: - Connection Approval Methods
-    private func cleanupApprovalState() {
-        pendingClientName = ""
-        currentApprovalHandlers = nil
-
-        if let clientID = pendingConnectionID {
-            activeApprovalDialogs.remove(clientID)
-            pendingConnectionID = nil
+    // MARK: - Disabled Tools Management
+    var disabledTools: Set<String> {
+        get {
+            (try? JSONDecoder().decode(Set<String>.self, from: disabledToolsData)) ?? []
         }
+        set {
+            objectWillChange.send()
+            disabledToolsData = (try? JSONEncoder().encode(newValue)) ?? Data()
+            disabledToolsGeneration += 1
+            let generation = disabledToolsGeneration
+            Task { await networkManager.updateDisabledTools(newValue, generation: generation) }
+        }
+    }
+
+    func isToolEnabled(_ name: String) -> Bool {
+        !disabledTools.contains(name)
+    }
+
+    func setTool(_ name: String, enabled: Bool) {
+        var tools = disabledTools
+        if enabled {
+            tools.remove(name)
+        } else {
+            tools.insert(name)
+        }
+        disabledTools = tools
+    }
+
+    func setService(_ config: ServiceConfig, enabled: Bool) {
+        objectWillChange.send()
+        config.binding.wrappedValue = enabled
+
+        Task {
+            if enabled, await !config.isActivated {
+                do {
+                    try await config.service.activate()
+                } catch {
+                    self.objectWillChange.send()
+                    config.binding.wrappedValue = false
+                }
+            }
+            await networkManager.updateServiceBindings(self.currentServiceBindings)
+        }
+    }
+
+    // MARK: - Connection Approval Methods
+    private func cleanupApprovalState(for clientID: String) {
+        activeApprovalDialogs.remove(clientID)
     }
 
     private func handlePendingApprovals(for clientID: String, approved: Bool) {
@@ -262,12 +316,14 @@ final class ServerController: ObservableObject {
     }
 
     init() {
-        Task {
+        Task { [self] in
             // Initialize bindings from AppStorage before the server starts.
             await networkManager.updateServiceBindings(self.currentServiceBindings)
-            await self.networkManager.start()
-            self.updateServerStatus("Running")
+            await networkManager.updateDisabledTools(self.disabledTools, generation: 0)
 
+            // Register the approval handler before advertising the Bonjour
+            // service. Otherwise the first connection after launch is rejected
+            // immediately because the handler is still nil.
             await networkManager.setConnectionApprovalHandler {
                 [weak self] connectionID, clientInfo in
                 guard let self = self else {
@@ -297,6 +353,9 @@ final class ServerController: ObservableObject {
                     }
                 }
             }
+
+            await self.networkManager.start()
+            self.updateServerStatus("Running")
         }
     }
 
@@ -364,8 +423,6 @@ final class ServerController: ObservableObject {
             return
         }
 
-        self.pendingConnectionID = clientID
-
         // Coalesce concurrent approvals for the same client.
         guard !activeApprovalDialogs.contains(clientID) else {
             log.info("Adding to pending approvals for client: \(clientID)")
@@ -376,11 +433,12 @@ final class ServerController: ObservableObject {
         activeApprovalDialogs.insert(clientID)
 
         // Present the approval window and wire callbacks.
-        pendingClientName = clientID
-        currentApprovalHandlers = (approve: approve, deny: deny)
-
         approvalWindowController.showApprovalWindow(
             clientName: clientID,
+            enabledServiceNames:
+                computedServiceConfigs
+                .filter { $0.binding.wrappedValue }
+                .map { $0.name },
             onApprove: { alwaysTrust in
                 if alwaysTrust {
                     self.addTrustedClient(clientID)
@@ -400,12 +458,12 @@ final class ServerController: ObservableObject {
                 }
 
                 approve()
-                self.cleanupApprovalState()
+                self.cleanupApprovalState(for: clientID)
                 self.handlePendingApprovals(for: clientID, approved: true)
             },
             onDeny: {
                 deny()
-                self.cleanupApprovalState()
+                self.cleanupApprovalState(for: clientID)
                 self.handlePendingApprovals(for: clientID, approved: false)
             }
         )
@@ -423,6 +481,7 @@ actor MCPConnectionManager {
     private let server: MCP.Server
     private var transport: NetworkTransport
     private let parentManager: ServerNetworkManager
+    private var isStopping = false
 
     init(connectionID: UUID, connection: NWConnection, parentManager: ServerNetworkManager) {
         self.connectionID = connectionID
@@ -474,6 +533,14 @@ actor MCPConnectionManager {
 
             // Monitor connection health for early disconnects.
             await startHealthMonitoring()
+
+            // The SDK ends the message loop when the client disconnects,
+            // but leaves the socket open. Close it without waiting for the health poll.
+            Task { [weak self] in
+                guard let self else { return }
+                await self.server.waitUntilCompleted()
+                await self.parentManager.removeConnection(self.connectionID)
+            }
         } catch {
             log.error("Failed to start MCP server: \(error.localizedDescription)")
             throw error
@@ -528,6 +595,9 @@ actor MCPConnectionManager {
     }
 
     func stop() async {
+        // App shutdown and message-loop completion can both stop this connection.
+        guard !isStopping else { return }
+        isStopping = true
         await server.stop()
         connection.cancel()
     }
@@ -539,6 +609,7 @@ actor NetworkDiscoveryManager {
     private let serviceDomain: String
     var listener: NWListener
     private let browser: NWBrowser
+    private var listenerStateHandler: (@Sendable (NWListener.State) -> Void)?
 
     init(serviceType: String, serviceDomain: String) throws {
         self.serviceType = serviceType
@@ -548,6 +619,9 @@ actor NetworkDiscoveryManager {
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
         parameters.includePeerToPeer = false
+        // Accept connections from this Mac only; the CLI connects over loopback (#229).
+        // IPv4 matches the protocol below and avoids NECP errors for an IPv6 wildcard.
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
 
         if let tcpOptions = parameters.defaultProtocolStack.internetProtocol
             as? NWProtocolIP.Options
@@ -555,9 +629,8 @@ actor NetworkDiscoveryManager {
             tcpOptions.version = .v4
         }
 
-        // Listen and advertise via Bonjour.
+        // Advertise once the listener has an assigned port.
         self.listener = try NWListener(using: parameters)
-        self.listener.service = NWListener.Service(type: serviceType, domain: serviceDomain)
 
         // Browser is used for monitoring and diagnostics.
         self.browser = NWBrowser(
@@ -572,7 +645,8 @@ actor NetworkDiscoveryManager {
         stateHandler: @escaping @Sendable (NWListener.State) -> Void,
         connectionHandler: @escaping @Sendable (NWConnection) -> Void
     ) {
-        listener.stateUpdateHandler = stateHandler
+        listenerStateHandler = stateHandler
+        configureStateHandler(for: listener)
 
         listener.newConnectionHandler = connectionHandler
 
@@ -580,6 +654,24 @@ actor NetworkDiscoveryManager {
         browser.start(queue: .main)
 
         log.info("Started network discovery and advertisement")
+    }
+
+    private func configureStateHandler(for listener: NWListener) {
+        let serviceType = self.serviceType
+        let serviceDomain = self.serviceDomain
+        let stateHandler = listenerStateHandler
+        listener.stateUpdateHandler = { [weak listener] state in
+            if case .ready = state, let listener, let port = listener.port {
+                // Publish the assigned port before clients can discover the service.
+                listener.service = NWListener.Service(
+                    name: "iMCP",
+                    type: serviceType,
+                    domain: serviceDomain,
+                    txtRecord: NWTXTRecord(["port": String(port.rawValue)])
+                )
+            }
+            stateHandler?(state)
+        }
     }
 
     func stop() {
@@ -595,6 +687,9 @@ actor NetworkDiscoveryManager {
         let parameters: NWParameters = NWParameters.tcp  // Explicit type
         parameters.acceptLocalOnly = true
         parameters.includePeerToPeer = false
+        // Accept connections from this Mac only; the CLI connects over loopback (#229).
+        // IPv4 matches the protocol below and avoids NECP errors for an IPv6 wildcard.
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
 
         if let tcpOptions = parameters.defaultProtocolStack.internetProtocol
             as? NWProtocolIP.Options
@@ -603,12 +698,7 @@ actor NetworkDiscoveryManager {
         }
 
         let newListener: NWListener = try NWListener(using: parameters)
-        let service = NWListener.Service(type: self.serviceType, domain: self.serviceDomain)
-        newListener.service = service
-
-        if let currentStateHandler = listener.stateUpdateHandler {
-            newListener.stateUpdateHandler = currentStateHandler
-        }
+        configureStateHandler(for: newListener)
 
         if let currentConnectionHandler = listener.newConnectionHandler {
             newListener.newConnectionHandler = currentConnectionHandler
@@ -641,6 +731,8 @@ actor ServerNetworkManager {
 
     private let services = ServiceRegistry.services
     private var serviceBindings: [String: Binding<Bool>] = [:]
+    private var disabledTools: Set<String> = []
+    private var disabledToolsLastGeneration = -1
 
     init() {
         do {
@@ -907,6 +999,10 @@ actor ServerNetworkManager {
                         isServiceEnabled
                     {
                         for tool in service.tools {
+                            if await self.disabledTools.contains(tool.name) {
+                                log.debug("Skipping disabled tool: \(tool.name)")
+                                continue
+                            }
                             log.debug("Adding tool: \(tool.name)")
                             tools.append(
                                 .init(
@@ -941,6 +1037,20 @@ actor ServerNetworkManager {
                     content: [
                         .text(
                             text: "iMCP is currently disabled. Please enable it to use tools.",
+                            annotations: nil,
+                            _meta: nil
+                        )
+                    ],
+                    isError: true
+                )
+            }
+
+            if await self.disabledTools.contains(params.name) {
+                log.notice("Tool call rejected: \(params.name) is disabled")
+                return CallTool.Result(
+                    content: [
+                        .text(
+                            text: "Tool \(params.name) is currently disabled in iMCP settings.",
                             annotations: nil,
                             _meta: nil
                         )
@@ -1047,6 +1157,22 @@ actor ServerNetworkManager {
     // Update service bindings.
     func updateServiceBindings(_ newBindings: [String: Binding<Bool>]) async {
         self.serviceBindings = newBindings
+
+        // Notify clients that tool availability may have changed.
+        Task {
+            for (_, connectionManager) in connections {
+                await connectionManager.notifyToolListChanged()
+            }
+        }
+    }
+
+    // Update the disabled tool set, discarding out-of-order deliveries.
+    func updateDisabledTools(_ newDisabledTools: Set<String>, generation: Int) async {
+        guard generation > disabledToolsLastGeneration else { return }
+        disabledToolsLastGeneration = generation
+
+        guard disabledTools != newDisabledTools else { return }
+        self.disabledTools = newDisabledTools
 
         // Notify clients that tool availability may have changed.
         Task {
